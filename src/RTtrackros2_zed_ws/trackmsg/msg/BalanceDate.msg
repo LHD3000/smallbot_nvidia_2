@@ -1,0 +1,12 @@
+float32 gyro
+float32 angle
+float32 gyro_z
+float32 current_speed
+float32 target_angle
+float32 target_gyro
+float32 left
+float32 right
+float32 target_speed
+float32 target_yaw_rate
+float32 battery_soc
+float32 battery_temperature

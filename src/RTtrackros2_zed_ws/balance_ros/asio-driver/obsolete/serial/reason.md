@@ -1,0 +1,1 @@
+can not be able to set custorm baudrate and crash with current serial driver

@@ -1,0 +1,13 @@
+cd /xxx/dev/control-algorithm # yourpath
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+sudo cmake --install build
+
+# if can find .su
+# you can run
+sudo ldconfig
+
+# if you want to use GPIO/SPI/CAN,you can install the rule of udev（recommonded）
+sudo cp /xxx/dev/asio-driver/scripts/95-device.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger

@@ -1,0 +1,28 @@
+打开你的 CMakeLists.txt，在文件末尾附近（ament_package() 之前，和你之前的 install 语句放在一块），添加以下这段代码：
+
+# ==========================================
+# 安装 launch 文件夹
+# ==========================================
+install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
+# 2. 编译你的包
+colcon build --packages-select balance_ros --symlink-install
+
+# 3. 刷新环境变量
+source install/setup.bash
+
+# 4. 一键启动！
+ros2 launch balance_ros joystick_control.launch.py
+
+  # 3. 启动你的 V2 版本平衡车控制节点
+        Node(
+            package='balance_ros',
+            executable='balance_track_node_v2',
+            name='balance_controller',
+            output='screen',
+            parameters=[{'banlance_offset':-4.8
+            }]
+        )
+    ])
