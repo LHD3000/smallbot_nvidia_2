@@ -110,7 +110,7 @@ class IMUDriverNode(Node):
         self.imu_msg.header.frame_id = 'imu_link'
 
         # 创建IMU数据发布器
-        self.imu_pub = self.create_publisher(Imu, 'imu/data_raw', 10)
+        self.imu_pub = self.create_publisher(Imu, 'imu/data_raw_b1', 10)
         
         # 初始化协方差矩阵（-1表示未知）
         self.imu_msg.orientation_covariance = [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

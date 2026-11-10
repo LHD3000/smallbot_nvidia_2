@@ -52,11 +52,11 @@ private:
         {
             // 订阅IMU话题
             subscription_ = this->create_subscription<sensor_msgs::msg::Imu>(
-                "/imu/data_raw",  // ZED IMU默认话题
+                "/imu/data_raw_b1",  // ZED IMU默认话题
                 10,  // QoS队列深度
                 std::bind(&ZedImuNode::imuCallback, this, std::placeholders::_1));
             
-            RCLCPP_INFO(this->get_logger(), "ZED IMU订阅器启动，监听话题: /zed/zed_node/imu/data");
+            RCLCPP_INFO(this->get_logger(), "ZED IMU订阅器启动，监听话题: /imu/data_raw_b1");
             
             // 可选：定时检查连接状态
             timer_ = this->create_wall_timer(

@@ -3,14 +3,14 @@
 <package format="3">
   <name>dock_motor_controller</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Dual docking motor controller driven by RC /rc_input (sensor_msgs/Joy), hold-to-run.</description>
   <maintainer email="nvidia@todo.todo">nvidia</maintainer>
-  <license>TODO: License declaration</license>
+  <license>TODO</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
-  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

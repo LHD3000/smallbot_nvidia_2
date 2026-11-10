@@ -1,0 +1,17 @@
+aruco_det:
+  ros__parameters:
+    dictionary_id: 10
+    # Total print 100 mm, black square 80 mm, white margin 10 mm on each side.
+    aruco_length: 0.08
+    primary_id: 0
+    # Empty target_aruco_ids defaults to a typed empty integer array in C++.
+    use_camera_info: false
+    calibration_width: 640
+    calibration_height: 480
+    sub_image_topic: /usb_cam/image_raw
+    image_qos_reliability: best_effort
+    camera_info_topic: /usb_cam/camera_info
+    camera_frame_id: camera_optical_frame
+    marker_frame_prefix: aruco_
+    publish_tf: true
+    max_reprojection_error: 3.0

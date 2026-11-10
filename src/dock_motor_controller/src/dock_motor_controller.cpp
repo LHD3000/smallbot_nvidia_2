@@ -1,1355 +1,405 @@
+// ================================================================
+//  Dock Motor Controller -- RC hold-to-run version
+//
+//  订阅:  /rc_input  (sensor_msgs/msg/Joy)
+//
+//  行为:
+//    - 按住 "tighten" 按钮 -> 两路电机 CW 全速转
+//    - 按住 "release" 按钮 -> 两路电机 CCW 全速转
+//    - 松开 / 两个键同时按 -> 立刻停
+//    - 超过 watchdog_timeout_ms 没收到 Joy 消息 -> 立刻停 (失联保护)
+//
+//  按钮索引通过 ROS 参数配置:
+//    tighten_button_index   (默认 4)
+//    release_button_index   (默认 5)
+//
+//  查按键索引:
+//    ros2 topic echo /rc_input
+//    按住某个开关, 看 buttons[] 哪个变成 1, 那就是 index
+// ================================================================
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/string.hpp>
+#include <sensor_msgs/msg/joy.hpp>
 
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <atomic>
 
 #include <gpiod.h>
 
-// ============================================================
-// Linux SocketCAN
-// ============================================================
-
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
-
-#include <linux/can.h>
-#include <linux/can/raw.h>
+#include <errno.h>
+#include <string.h>
+#include <unistd.h>   // access()
 
 using namespace std::chrono_literals;
 
-
 // ================================================================
-// Dock Motor Controller
+//  Dock Motor Controller
 // ================================================================
-
 class DockMotorController : public rclcpp::Node
 {
 public:
-
     DockMotorController()
         : Node("dock_motor_controller")
     {
+        // --------------------------------------------------------
+        // ROS 参数: 按钮索引 / 看门狗
+        // --------------------------------------------------------
+        tighten_btn_ =
+            this->declare_parameter<int>("tighten_button_index", 4);
+        release_btn_ =
+            this->declare_parameter<int>("release_button_index", 5);
+        watchdog_timeout_ms_ =
+            this->declare_parameter<int>("watchdog_timeout_ms", 500);
+
         RCLCPP_INFO(
             this->get_logger(),
-            "Initializing dual docking motor controller...");
+            "Initializing dock motor controller (RC hold-to-run)...");
 
         // ========================================================
-        // 硬件映射
-        // ========================================================
+        // 硬件映射 (和原版一致)
         //
-        // Motor 1
+        // Motor1
         //   Speed    : Pin 32 -> PWM7 -> pwmchip3/pwm0
         //   Direction: Pin 15 -> PWM1 -> pwmchip0/pwm0
         //
-        // Motor 2
+        // Motor2
         //   Speed    : Pin 33 -> PWM5 -> pwmchip2/pwm0
         //   Direction: Pin 7  -> GPIO09 -> gpiochip0 line 144
-        //
         // ========================================================
+        speed_pwm1_path_ = "/sys/class/pwm/pwmchip3/pwm0";
+        dir_pwm1_path_   = "/sys/class/pwm/pwmchip0/pwm0";
+        speed_pwm2_path_ = "/sys/class/pwm/pwmchip2/pwm0";
 
-        speed_pwm1_path_ =
-            "/sys/class/pwm/pwmchip3/pwm0";
-
-        dir_pwm1_path_ =
-            "/sys/class/pwm/pwmchip0/pwm0";
-
-        speed_pwm2_path_ =
-            "/sys/class/pwm/pwmchip2/pwm0";
-
-
-        // ========================================================
-        // 初始化 PWM
-        // ========================================================
-
+        // --------------------------------------------------------
+        // 初始化 PWM / GPIO
+        // --------------------------------------------------------
         if (!initPWM(speed_pwm1_path_))
-        {
-            throw std::runtime_error(
-                "Motor1 speed PWM initialization failed");
-        }
-
+            throw std::runtime_error("Motor1 speed PWM init failed");
         if (!initPWM(dir_pwm1_path_))
-        {
-            throw std::runtime_error(
-                "Motor1 direction PWM initialization failed");
-        }
-
+            throw std::runtime_error("Motor1 dir PWM init failed");
         if (!initPWM(speed_pwm2_path_))
-        {
-            throw std::runtime_error(
-                "Motor2 speed PWM initialization failed");
-        }
-
-
-        // ========================================================
-        // 初始化 GPIO
-        // ========================================================
-
+            throw std::runtime_error("Motor2 speed PWM init failed");
         if (!initGPIO())
-        {
-            throw std::runtime_error(
-                "Motor2 direction GPIO initialization failed");
-        }
+            throw std::runtime_error("Motor2 dir GPIO init failed");
 
-
-        // ========================================================
-        // 上电默认停止
-        // ========================================================
-
+        // 上电默认停止, 方向先设 CCW (无害)
         stopMotors();
-
         setDirectionCCW();
 
+        // --------------------------------------------------------
+        // 订阅遥控器 /rc_input
+        // --------------------------------------------------------
+        joy_sub_ = this->create_subscription<sensor_msgs::msg::Joy>(
+            "/rc_input_b1",
+            10,
+            std::bind(
+                &DockMotorController::joyCallback,
+                this,
+                std::placeholders::_1));
 
-        // ========================================================
-        // ROS2 subscriber
-        // ========================================================
+        // --------------------------------------------------------
+        // 看门狗定时器: 50 Hz 周期, 检查失联 + 刷新电机状态
+        // --------------------------------------------------------
+        watchdog_timer_ = this->create_wall_timer(
+            20ms,
+            std::bind(&DockMotorController::watchdogTick, this));
 
-        command_sub_ =
-            this->create_subscription<std_msgs::msg::String>(
-                "/dock_motor/command",
-                10,
-                std::bind(
-                    &DockMotorController::commandCallback,
-                    this,
-                    std::placeholders::_1));
+        last_rc_time_ = this->now();
 
-
-        // ========================================================
-        // 打开 CAN1
-        // ========================================================
-
-        if (!initCAN())
-        {
-            throw std::runtime_error(
-                "CAN1 initialization failed");
-        }
-
-
-        // ========================================================
-        // 启动 CAN 接收线程
-        // ========================================================
-
-        can_running_ = true;
-
-        can_thread_ =
-            std::thread(
-                &DockMotorController::canReceiveLoop,
-                this);
-
-
-        // ========================================================
-        // 启动电机控制线程
-        // ========================================================
-
-        motor_thread_ =
-            std::thread(
-                &DockMotorController::motorControlLoop,
-                this);
-
-
-        // ========================================================
-        // 打印配置
-        // ========================================================
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "==========================================");
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Dual Dock Motor Controller started");
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Motor1 speed : PWM7 -> pwmchip3/pwm0");
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Motor1 dir   : PWM1 -> pwmchip0/pwm0");
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Motor2 speed : PWM5 -> pwmchip2/pwm0");
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Motor2 dir   : GPIO09 -> gpiochip0 line 144");
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "PWM period   : %d ns",
-            kPeriodNs);
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "STOP duty    : %d ns",
-            kStopDutyNs);
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "MAX duty     : %d ns",
-            kMaxRunDutyNs);
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "CAN interface: can1");
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "CAN ID       : 0x%03X",
-            kCanCommandId);
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Tighten cmd  : 0x%02X -> 3.5 s",
-            kCanTightenCmd);
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Release cmd  : 0x%02X -> 4.0 s",
-            kCanReleaseCmd);
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "ROS commands:");
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "  run_cw");
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "  run_ccw");
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "  stop");
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "==========================================");
+        // --------------------------------------------------------
+        // 启动日志
+        // --------------------------------------------------------
+        RCLCPP_INFO(this->get_logger(), "==========================================");
+        RCLCPP_INFO(this->get_logger(), "Dock Motor Controller (RC hold) started");
+        RCLCPP_INFO(this->get_logger(), "Subscribed topic : /rc_input (sensor_msgs/Joy)");
+        RCLCPP_INFO(this->get_logger(), "Tighten button   : buttons[%d]  (CW)", tighten_btn_);
+        RCLCPP_INFO(this->get_logger(), "Release button   : buttons[%d]  (CCW)", release_btn_);
+        RCLCPP_INFO(this->get_logger(), "Watchdog timeout : %d ms", watchdog_timeout_ms_);
+        RCLCPP_INFO(this->get_logger(), "PWM period       : %d ns", kPeriodNs);
+        RCLCPP_INFO(this->get_logger(), "STOP duty        : %d ns", kStopDutyNs);
+        RCLCPP_INFO(this->get_logger(), "MAX duty         : %d ns", kMaxRunDutyNs);
+        RCLCPP_INFO(this->get_logger(), "------------------------------------------");
+        RCLCPP_INFO(this->get_logger(), "Find button index:");
+        RCLCPP_INFO(this->get_logger(), "  ros2 topic echo /rc_input");
+        RCLCPP_INFO(this->get_logger(), "  hold a switch, watch buttons[] which turns to 1");
+        RCLCPP_INFO(this->get_logger(), "==========================================");
     }
 
-
-    // ============================================================
-    // 析构
-    // ============================================================
-
-    ~DockMotorController()
+    ~DockMotorController() override
     {
-        // 停止 CAN 线程
-        can_running_ = false;
-
-        // 唤醒 motor thread
-        {
-            std::lock_guard<std::mutex> lock(command_mutex_);
-            command_cv_.notify_all();
-        }
-
-        // 关闭 CAN socket
-        if (can_socket_ >= 0)
-        {
-            shutdown(
-                can_socket_,
-                SHUT_RDWR);
-
-            close(can_socket_);
-
-            can_socket_ = -1;
-        }
-
-        // 等待 CAN 线程退出
-        if (can_thread_.joinable())
-        {
-            can_thread_.join();
-        }
-
-        // 等待 motor thread 退出
-        if (motor_thread_.joinable())
-        {
-            motor_thread_.join();
-        }
-
-        // 强制停止
         stopMotors();
-
-        // 释放 GPIO
-        if (gpio_line_ != nullptr)
-        {
-            gpiod_line_release(gpio_line_);
-            gpio_line_ = nullptr;
-        }
-
-        if (gpio_chip_ != nullptr)
-        {
-            gpiod_chip_close(gpio_chip_);
-            gpio_chip_ = nullptr;
-        }
+        if (gpio_line_ != nullptr) { gpiod_line_release(gpio_line_); gpio_line_ = nullptr; }
+        if (gpio_chip_ != nullptr) { gpiod_chip_close(gpio_chip_); gpio_chip_ = nullptr; }
     }
-
 
 private:
-
     // ============================================================
-    // PWM 参数
+    // PWM 参数 (和原版一致)
     // ============================================================
-
-    static constexpr int kPeriodNs = 50000;
-
-    static constexpr int kStopDutyNs = 50000;
-
-    // 你现在实测最高速
-    static constexpr int kMaxRunDutyNs = 10;
-
-
-    // ============================================================
-    // Motor2 GPIO
-    // ============================================================
+    static constexpr int kPeriodNs     = 50000;   // 20 kHz
+    static constexpr int kStopDutyNs   = 50000;   // 100% HIGH -> 停 (反逻辑驱动板)
+    static constexpr int kMaxRunDutyNs = 10;       // ~0% HIGH  -> 全速
 
     static constexpr unsigned int kMotor2DirLine = 144;
 
-
     // ============================================================
-    // CAN 参数
+    // GPIO / PWM paths
     // ============================================================
-
-    // ========================================================
-    // 这里改成你的实际 CAN ID
-    // ========================================================
-
-    static constexpr canid_t kCanCommandId = 0x123;
-
-
-    // ========================================================
-    // CAN 数据
-    //
-    // data[0] = 0x01 -> 拧紧
-    // data[0] = 0x02 -> 松开
-    // ========================================================
-
-    static constexpr uint8_t kCanTightenCmd = 0x01;
-
-    static constexpr uint8_t kCanReleaseCmd = 0x02;
-
-
-    // ============================================================
-    // 电机动作
-    // ============================================================
-
-    enum class MotorAction
-    {
-        NONE,
-        TIGHTEN,
-        RELEASE
-    };
-
-
-    // ============================================================
-    // GPIO
-    // ============================================================
-
     gpiod_chip* gpio_chip_{nullptr};
-
     gpiod_line* gpio_line_{nullptr};
 
-
-    // ============================================================
-    // PWM
-    // ============================================================
-
     std::string speed_pwm1_path_;
-
     std::string dir_pwm1_path_;
-
     std::string speed_pwm2_path_;
 
+    // ============================================================
+    // ROS
+    // ============================================================
+    rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joy_sub_;
+    rclcpp::TimerBase::SharedPtr                           watchdog_timer_;
+
+    int            tighten_btn_        = 4;
+    int            release_btn_        = 5;
+    int            watchdog_timeout_ms_ = 500;
 
     // ============================================================
-    // ROS2
+    // 最新遥控器状态 (被 Joy 回调写, 被看门狗定时器读)
     // ============================================================
+    std::mutex rc_mutex_;
+    bool       tighten_pressed_{false};
+    bool       release_pressed_{false};
+    rclcpp::Time last_rc_time_{0, 0, RCL_ROS_TIME};
+    bool       have_rc_{false};
 
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr
-        command_sub_;
-
-
-    // ============================================================
-    // CAN
-    // ============================================================
-
-    int can_socket_{-1};
-
-    std::atomic<bool> can_running_{false};
-
-    std::thread can_thread_;
-
-
-    // ============================================================
-    // Motor Control Thread
-    // ============================================================
-
-    std::thread motor_thread_;
-
-    std::mutex command_mutex_;
-
-    std::condition_variable command_cv_;
-
-    MotorAction requested_action_{MotorAction::NONE};
-
+    // 当前已经输出的动作: 0=stop, 1=CW, 2=CCW
+    int applied_action_{0};
 
     // ============================================================
     // sysfs 写入
     // ============================================================
-
-    bool writeFile(
-        const std::string& path,
-        const std::string& value)
+    bool writeFile(const std::string& path, const std::string& value)
     {
         std::string command =
-            "printf '%s\\n' '" +
-            value +
-            "' | sudo -n tee '" +
-            path +
-            "' > /dev/null";
-
-        const int ret =
-            std::system(command.c_str());
-
-        if (ret != 0)
-        {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Failed to write: %s = %s, ret=%d",
-                path.c_str(),
-                value.c_str(),
-                ret);
-
+            "printf '%s\\n' '" + value + "' | sudo -n tee '" + path + "' > /dev/null";
+        const int ret = std::system(command.c_str());
+        if (ret != 0) {
+            RCLCPP_ERROR(this->get_logger(),
+                         "write fail: %s = %s, ret=%d",
+                         path.c_str(), value.c_str(), ret);
             return false;
         }
-
         return true;
     }
 
-
     // ============================================================
-    // 初始化 PWM
+    // PWM 初始化
     // ============================================================
-
-    bool initPWM(
-        const std::string& pwm_path)
+    bool initPWM(const std::string& pwm_path)
     {
         const std::string pwm_name = "/pwm0";
-
-        const auto pos =
-            pwm_path.rfind(pwm_name);
-
-        if (pos == std::string::npos)
-        {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Invalid PWM path: %s",
-                pwm_path.c_str());
-
+        const auto pos = pwm_path.rfind(pwm_name);
+        if (pos == std::string::npos) {
+            RCLCPP_ERROR(this->get_logger(), "bad PWM path: %s", pwm_path.c_str());
             return false;
         }
+        const std::string chip_path = pwm_path.substr(0, pos);
 
-        const std::string chip_path =
-            pwm_path.substr(0, pos);
-
-
-        // --------------------------------------------------------
-        // 检查是否已经 export
-        // --------------------------------------------------------
-
-        {
-            std::ifstream test(
-                pwm_path + "/period");
-
-            if (!test.good())
-            {
-                RCLCPP_INFO(
-                    this->get_logger(),
-                    "Exporting PWM: %s",
-                    pwm_path.c_str());
-
-                std::string command =
-                    "printf '0\\n' | sudo -n tee '" +
-                    chip_path +
-                    "/export' > /dev/null";
-
-                const int ret =
-                    std::system(command.c_str());
-
-                if (ret != 0)
-                {
-                    RCLCPP_ERROR(
-                        this->get_logger(),
-                        "Failed to export PWM: %s",
-                        pwm_path.c_str());
-
-                    return false;
-                }
-
-                std::this_thread::sleep_for(200ms);
+        // 检查是否已 export
+        if (access((pwm_path + "/period").c_str(), F_OK) != 0) {
+            RCLCPP_INFO(this->get_logger(), "exporting PWM: %s", pwm_path.c_str());
+            std::string cmd =
+                "printf '0\\n' | sudo -n tee '" + chip_path + "/export' > /dev/null";
+            if (std::system(cmd.c_str()) != 0) {
+                RCLCPP_ERROR(this->get_logger(), "export failed: %s", pwm_path.c_str());
+                return false;
             }
+            std::this_thread::sleep_for(200ms);
         }
 
+        if (!writeFile(pwm_path + "/period",     std::to_string(kPeriodNs)))   return false;
+        if (!writeFile(pwm_path + "/duty_cycle", std::to_string(kStopDutyNs))) return false;
+        if (!writeFile(pwm_path + "/enable",    "1"))                         return false;
 
-        // --------------------------------------------------------
-        // 设置周期
-        // --------------------------------------------------------
-
-        if (!writeFile(
-                pwm_path + "/period",
-                std::to_string(kPeriodNs)))
-        {
-            return false;
-        }
-
-
-        // --------------------------------------------------------
-        // 初始停止
-        // --------------------------------------------------------
-
-        if (!writeFile(
-                pwm_path + "/duty_cycle",
-                std::to_string(kStopDutyNs)))
-        {
-            return false;
-        }
-
-
-        // --------------------------------------------------------
-        // Enable
-        // --------------------------------------------------------
-
-        if (!writeFile(
-                pwm_path + "/enable",
-                "1"))
-        {
-            return false;
-        }
-
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "PWM initialized: %s",
-            pwm_path.c_str());
-
+        RCLCPP_INFO(this->get_logger(), "PWM ok: %s", pwm_path.c_str());
         return true;
     }
 
-
     // ============================================================
-    // 初始化 GPIO
+    // GPIO 初始化
     // ============================================================
-
     bool initGPIO()
     {
-        gpio_chip_ =
-            gpiod_chip_open(
-                "/dev/gpiochip0");
-
-        if (gpio_chip_ == nullptr)
-        {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Failed to open /dev/gpiochip0");
-
+        gpio_chip_ = gpiod_chip_open("/dev/gpiochip0");
+        if (!gpio_chip_) {
+            RCLCPP_ERROR(this->get_logger(), "open /dev/gpiochip0 failed");
             return false;
         }
-
-
-        gpio_line_ =
-            gpiod_chip_get_line(
-                gpio_chip_,
-                kMotor2DirLine);
-
-        if (gpio_line_ == nullptr)
-        {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Failed to get GPIO line %u",
-                kMotor2DirLine);
-
+        gpio_line_ = gpiod_chip_get_line(gpio_chip_, kMotor2DirLine);
+        if (!gpio_line_) {
+            RCLCPP_ERROR(this->get_logger(), "get line %u failed", kMotor2DirLine);
             return false;
         }
-
-
-        const int ret =
-            gpiod_line_request_output(
-                gpio_line_,
-                "dock_motor_controller",
-                0);
-
-        if (ret < 0)
-        {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Failed to request GPIO line %u",
-                kMotor2DirLine);
-
+        const int ret = gpiod_line_request_output(gpio_line_, "dock_motor_controller", 0);
+        if (ret < 0) {
+            RCLCPP_ERROR(this->get_logger(),
+                         "request line %u failed: ret=%d errno=%d (%s)",
+                         kMotor2DirLine, ret, errno, strerror(errno));
             return false;
         }
-
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "GPIO initialized: gpiochip0 line %u",
-            kMotor2DirLine);
-
+        RCLCPP_INFO(this->get_logger(), "GPIO ok: gpiochip0 line %u", kMotor2DirLine);
         return true;
     }
 
-
-    // ============================================================
-    // GPIO 设置
-    // ============================================================
-
-    bool setGPIOValue(
-        int value)
+    bool setGPIOValue(int v)
     {
-        if (gpio_line_ == nullptr)
-        {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "GPIO line is not initialized");
-
+        if (!gpio_line_) return false;
+        if (gpiod_line_set_value(gpio_line_, v ? 1 : 0) < 0) {
+            RCLCPP_ERROR(this->get_logger(), "set GPIO %u failed", kMotor2DirLine);
             return false;
         }
-
-
-        const int ret =
-            gpiod_line_set_value(
-                gpio_line_,
-                value ? 1 : 0);
-
-        if (ret < 0)
-        {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Failed to set GPIO line %u",
-                kMotor2DirLine);
-
-            return false;
-        }
-
         return true;
     }
 
-
     // ============================================================
-    // 两个电机最高速
+    // 电机动作
     // ============================================================
-
     void runMotorsAtMaxSpeed()
     {
-        const bool ok1 =
-            writeFile(
-                speed_pwm1_path_ +
-                    "/duty_cycle",
-                std::to_string(
-                    kMaxRunDutyNs));
-
-        const bool ok2 =
-            writeFile(
-                speed_pwm2_path_ +
-                    "/duty_cycle",
-                std::to_string(
-                    kMaxRunDutyNs));
-
-
-        if (!ok1 || !ok2)
-        {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Failed to start motors at maximum speed");
-
-            return;
-        }
-
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Both docking motors RUN at MAX speed");
+        writeFile(speed_pwm1_path_ + "/duty_cycle", std::to_string(kMaxRunDutyNs));
+        writeFile(speed_pwm2_path_ + "/duty_cycle", std::to_string(kMaxRunDutyNs));
     }
-
-
-    // ============================================================
-    // 停止
-    // ============================================================
 
     void stopMotors()
     {
-        writeFile(
-            speed_pwm1_path_ +
-                "/duty_cycle",
-            std::to_string(
-                kStopDutyNs));
-
-        writeFile(
-            speed_pwm2_path_ +
-                "/duty_cycle",
-            std::to_string(
-                kStopDutyNs));
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Both docking motors STOP");
+        writeFile(speed_pwm1_path_ + "/duty_cycle", std::to_string(kStopDutyNs));
+        writeFile(speed_pwm2_path_ + "/duty_cycle", std::to_string(kStopDutyNs));
     }
-
-
-    // ============================================================
-    // CW
-    // ============================================================
 
     void setDirectionCW()
     {
-        // Motor1:
-        // LOW -> CW
-
-        const bool ok1 =
-            writeFile(
-                dir_pwm1_path_ +
-                    "/duty_cycle",
-                "0");
-
-
-        // Motor2:
-        // LOW -> CW
-
-        const bool ok2 =
-            setGPIOValue(0);
-
-
-        if (ok1 && ok2)
-        {
-            RCLCPP_INFO(
-                this->get_logger(),
-                "Both docking motors direction = CW");
-        }
+        writeFile(dir_pwm1_path_ + "/duty_cycle", "0");       // Motor1 LOW
+        setGPIOValue(0);                                       // Motor2 LOW
     }
-
-
-    // ============================================================
-    // CCW
-    // ============================================================
 
     void setDirectionCCW()
     {
-        // Motor1:
-        // HIGH -> CCW
+        writeFile(dir_pwm1_path_ + "/duty_cycle", std::to_string(kPeriodNs)); // Motor1 HIGH
+        setGPIOValue(1);                                                       // Motor2 HIGH
+    }
 
-        const bool ok1 =
-            writeFile(
-                dir_pwm1_path_ +
-                    "/duty_cycle",
-                std::to_string(
-                    kPeriodNs));
+    // ============================================================
+    // Joy 回调: 只更新状态, 不动电机
+    // ============================================================
+    void joyCallback(const sensor_msgs::msg::Joy::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(rc_mutex_);
+        last_rc_time_ = this->now();
+        have_rc_      = true;
 
+        tighten_pressed_ =
+            (tighten_btn_ >= 0 && tighten_btn_ < (int)msg->buttons.size())
+            ? (msg->buttons[tighten_btn_] != 0) : false;
 
-        // Motor2:
-        // HIGH -> CCW
+        release_pressed_ =
+            (release_btn_ >= 0 && release_btn_ < (int)msg->buttons.size())
+            ? (msg->buttons[release_btn_] != 0) : false;
+    }
 
-        const bool ok2 =
-            setGPIOValue(1);
+    // ============================================================
+    // 看门狗 / 控制刷新 (50 Hz)
+    // ============================================================
+    void watchdogTick()
+    {
+        bool t = false, r = false;
+        bool lost = false;
 
-
-        if (ok1 && ok2)
         {
-            RCLCPP_INFO(
-                this->get_logger(),
-                "Both docking motors direction = CCW");
-        }
-    }
+            std::lock_guard<std::mutex> lock(rc_mutex_);
+            t = tighten_pressed_;
+            r = release_pressed_;
 
-
-    // ============================================================
-    // 请求新的动作
-    // ============================================================
-
-    void requestAction(
-        MotorAction action)
-    {
-        {
-            std::lock_guard<std::mutex> lock(
-                command_mutex_);
-
-            requested_action_ = action;
-        }
-
-        command_cv_.notify_one();
-    }
-
-
-    // ============================================================
-    // 检查当前是否有新的命令
-    // ============================================================
-
-    bool hasNewCommand()
-    {
-        std::lock_guard<std::mutex> lock(
-            command_mutex_);
-
-        return requested_action_ !=
-               MotorAction::NONE;
-    }
-
-
-    // ============================================================
-    // 取出新命令
-    // ============================================================
-
-    MotorAction takeRequestedAction()
-    {
-        std::lock_guard<std::mutex> lock(
-            command_mutex_);
-
-        MotorAction action =
-            requested_action_;
-
-        requested_action_ =
-            MotorAction::NONE;
-
-        return action;
-    }
-
-
-    // ============================================================
-    // 电机控制线程
-    // ============================================================
-
-    void motorControlLoop()
-    {
-        while (rclcpp::ok())
-        {
-            MotorAction action;
-
-            // ----------------------------------------------------
-            // 等待新动作
-            // ----------------------------------------------------
-
-            {
-                std::unique_lock<std::mutex> lock(
-                    command_mutex_);
-
-                command_cv_.wait(
-                    lock,
-                    [this]()
-                    {
-                        return
-                            requested_action_ !=
-                                MotorAction::NONE
-                            ||
-                            !rclcpp::ok();
-                    });
-
-                if (!rclcpp::ok())
-                {
-                    break;
+            if (have_rc_) {
+                const double dt_ms =
+                    (this->now() - last_rc_time_).seconds() * 1000.0;
+                if (dt_ms > watchdog_timeout_ms_) {
+                    lost = true;
                 }
-
-                action =
-                    requested_action_;
-
-                requested_action_ =
-                    MotorAction::NONE;
             }
+        }
 
+        int desired = 0;
+        if (!lost) {
+            // 互斥: 单键按下才动, 双键同按 / 都不按 -> 停
+            if (t && !r)      desired = 1;  // CW = 拧紧
+            else if (r && !t) desired = 2;  // CCW = 松开
+            else              desired = 0;
+        } else {
+            desired = 0;
+        }
 
-            // ----------------------------------------------------
-            // 先停止
-            // ----------------------------------------------------
+        applyAction(desired, lost);
+    }
 
+    // ============================================================
+    // 根据目标动作驱动硬件, 带边沿切换保护
+    // ============================================================
+    void applyAction(int desired, bool lost)
+    {
+        if (desired == applied_action_) {
+            // 状态没变, 啥也不做 (避免每次都写 sysfs)
+            return;
+        }
+
+        const int prev = applied_action_;
+
+        // 正在转 -> 要换方向 / 要停: 先刹一下
+        if (prev != 0) {
             stopMotors();
+            std::this_thread::sleep_for(100ms);
+        }
 
-            std::this_thread::sleep_for(
-                200ms);
-
-
-            // ----------------------------------------------------
-            // 判断方向
-            // ----------------------------------------------------
-
-            double run_time = 0.0;
-
-
-            if (action == MotorAction::TIGHTEN)
-            {
-                RCLCPP_INFO(
-                    this->get_logger(),
-                    "CAN command: TIGHTEN");
-
-                setDirectionCW();
-
-                run_time = 3.5;
-            }
-            else if (action == MotorAction::RELEASE)
-            {
-                RCLCPP_INFO(
-                    this->get_logger(),
-                    "CAN command: RELEASE");
-
-                setDirectionCCW();
-
-                run_time = 4.0;
-            }
-            else
-            {
-                continue;
-            }
-
-
-            // ----------------------------------------------------
-            // 等待方向稳定
-            // ----------------------------------------------------
-
-            std::this_thread::sleep_for(
-                300ms);
-
-
-            // ----------------------------------------------------
-            // 启动电机
-            // ----------------------------------------------------
-
+        if (desired == 1) {
+            setDirectionCW();
+            std::this_thread::sleep_for(50ms);  // 方向电平稳定
             runMotorsAtMaxSpeed();
-
-
-            // ----------------------------------------------------
-            // 计时
-            //
-            // 每 10 ms 检查一次有没有新的 CAN 命令
-            // ----------------------------------------------------
-
-            const auto start =
-                std::chrono::steady_clock::now();
-
-            bool interrupted = false;
-
-            while (true)
-            {
-                if (hasNewCommand())
-                {
-                    interrupted = true;
-                    break;
-                }
-
-
-                const auto now =
-                    std::chrono::steady_clock::now();
-
-                const double elapsed =
-                    std::chrono::duration<double>(
-                        now - start).count();
-
-
-                if (elapsed >= run_time)
-                {
-                    break;
-                }
-
-
-                std::this_thread::sleep_for(
-                    10ms);
-            }
-
-
-            // ----------------------------------------------------
-            // 停止
-            // ----------------------------------------------------
-
+            RCLCPP_INFO(this->get_logger(), "MOTOR RUN  CW (tighten)");
+        } else if (desired == 2) {
+            setDirectionCCW();
+            std::this_thread::sleep_for(50ms);
+            runMotorsAtMaxSpeed();
+            RCLCPP_INFO(this->get_logger(), "MOTOR RUN  CCW (release)");
+        } else {
             stopMotors();
-
-
-            if (interrupted)
-            {
-                RCLCPP_INFO(
-                    this->get_logger(),
-                    "Motor action interrupted by new command");
-            }
-            else
-            {
-                RCLCPP_INFO(
-                    this->get_logger(),
-                    "Motor action finished automatically");
+            if (lost) {
+                RCLCPP_WARN(this->get_logger(),
+                            "MOTOR STOPPED (RC watchdog trip)");
+            } else {
+                RCLCPP_INFO(this->get_logger(), "MOTOR STOP");
             }
         }
 
-
-        stopMotors();
-    }
-
-
-    // ============================================================
-    // 初始化 CAN1
-    // ============================================================
-
-    bool initCAN()
-    {
-        // --------------------------------------------------------
-        // 创建 RAW CAN socket
-        // --------------------------------------------------------
-
-        can_socket_ =
-            socket(
-                PF_CAN,
-                SOCK_RAW,
-                CAN_RAW);
-
-        if (can_socket_ < 0)
-        {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Failed to create CAN socket");
-
-            return false;
-        }
-
-
-        // --------------------------------------------------------
-        // 获取 can1 接口索引
-        // --------------------------------------------------------
-
-        struct ifreq ifr {};
-
-        std::snprintf(
-            ifr.ifr_name,
-            IFNAMSIZ,
-            "can1");
-
-
-        if (ioctl(
-                can_socket_,
-                SIOCGIFINDEX,
-                &ifr) < 0)
-        {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Failed to get CAN1 interface index");
-
-            close(can_socket_);
-            can_socket_ = -1;
-
-            return false;
-        }
-
-
-        // --------------------------------------------------------
-        // 绑定 can1
-        // --------------------------------------------------------
-
-        struct sockaddr_can addr {};
-
-        addr.can_family =
-            AF_CAN;
-
-        addr.can_ifindex =
-            ifr.ifr_ifindex;
-
-
-        if (bind(
-                can_socket_,
-                reinterpret_cast<struct sockaddr*>(
-                    &addr),
-                sizeof(addr)) < 0)
-        {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Failed to bind CAN1");
-
-            close(can_socket_);
-            can_socket_ = -1;
-
-            return false;
-        }
-
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "CAN1 initialized successfully");
-
-        return true;
-    }
-
-
-    // ============================================================
-    // CAN 接收线程
-    // ============================================================
-
-    void canReceiveLoop()
-    {
-        RCLCPP_INFO(
-            this->get_logger(),
-            "CAN1 receive thread started");
-
-
-        while (can_running_)
-        {
-            struct can_frame frame {};
-
-            const int nbytes =
-                read(
-                    can_socket_,
-                    &frame,
-                    sizeof(frame));
-
-
-            if (!can_running_)
-            {
-                break;
-            }
-
-
-            if (nbytes < 0)
-            {
-                if (errno == EINTR)
-                {
-                    continue;
-                }
-
-                if (!can_running_)
-                {
-                    break;
-                }
-
-                RCLCPP_ERROR(
-                    this->get_logger(),
-                    "CAN1 read error");
-
-                std::this_thread::sleep_for(
-                    100ms);
-
-                continue;
-            }
-
-
-            if (nbytes != sizeof(frame))
-            {
-                continue;
-            }
-
-
-            // ----------------------------------------------------
-            // 打印收到的 CAN 帧
-            // ----------------------------------------------------
-
-            RCLCPP_DEBUG(
-                this->get_logger(),
-                "CAN1 RX ID=0x%03X DLC=%d DATA[0]=0x%02X",
-                frame.can_id & CAN_SFF_MASK,
-                frame.can_dlc,
-                frame.can_dlc > 0
-                    ? frame.data[0]
-                    : 0);
-
-
-            // ----------------------------------------------------
-            // 检查 CAN ID
-            // ----------------------------------------------------
-
-            const canid_t rx_id =
-                frame.can_id &
-                CAN_SFF_MASK;
-
-
-            if (rx_id != kCanCommandId)
-            {
-                continue;
-            }
-
-
-            // ----------------------------------------------------
-            // 至少需要一个数据字节
-            // ----------------------------------------------------
-
-            if (frame.can_dlc < 1)
-            {
-                continue;
-            }
-
-
-            // ----------------------------------------------------
-            // 判断命令
-            // ----------------------------------------------------
-
-            const uint8_t cmd =
-                frame.data[0];
-
-
-            // ====================================================
-            // 拧紧
-            // ====================================================
-
-            if (cmd == kCanTightenCmd)
-            {
-                RCLCPP_INFO(
-                    this->get_logger(),
-                    "CAN1: TIGHTEN command received");
-
-                requestAction(
-                    MotorAction::TIGHTEN);
-
-                continue;
-            }
-
-
-            // ====================================================
-            // 松开
-            // ====================================================
-
-            if (cmd == kCanReleaseCmd)
-            {
-                RCLCPP_INFO(
-                    this->get_logger(),
-                    "CAN1: RELEASE command received");
-
-                requestAction(
-                    MotorAction::RELEASE);
-
-                continue;
-            }
-        }
-
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "CAN1 receive thread stopped");
-    }
-
-
-    // ============================================================
-    // ROS2 命令
-    // ============================================================
-
-    void commandCallback(
-        const std_msgs::msg::String::SharedPtr msg)
-    {
-        const std::string cmd =
-            msg->data;
-
-
-        RCLCPP_INFO(
-            this->get_logger(),
-            "Received ROS command: %s",
-            cmd.c_str());
-
-
-        // --------------------------------------------------------
-        // run_cw
-        //
-        // 为了保持你之前的测试方式，
-        // ROS 的 run_cw 也执行固定 3.5 秒
-        // --------------------------------------------------------
-
-        if (cmd == "run_cw")
-        {
-            requestAction(
-                MotorAction::TIGHTEN);
-
-            return;
-        }
-
-
-        // --------------------------------------------------------
-        // run_ccw
-        //
-        // ROS 的 run_ccw 执行固定 4 秒
-        // --------------------------------------------------------
-
-        if (cmd == "run_ccw")
-        {
-            requestAction(
-                MotorAction::RELEASE);
-
-            return;
-        }
-
-
-        // --------------------------------------------------------
-        // stop
-        // --------------------------------------------------------
-
-        if (cmd == "stop")
-        {
-            requestAction(
-                MotorAction::NONE);
-
-            stopMotors();
-
-            return;
-        }
-
-
-        // --------------------------------------------------------
-        // 兼容旧 speed 命令
-        // --------------------------------------------------------
-
-        if (cmd.rfind("speed:", 0) == 0)
-        {
-            RCLCPP_INFO(
-                this->get_logger(),
-                "speed command ignored, use fixed MAX speed");
-
-            return;
-        }
-
-
-        RCLCPP_WARN(
-            this->get_logger(),
-            "Unknown ROS command: %s",
-            cmd.c_str());
+        applied_action_ = desired;
     }
 };
 
-
 // ================================================================
-// main
-// ================================================================
-
-int main(
-    int argc,
-    char* argv[])
+int main(int argc, char** argv)
 {
-    rclcpp::init(
-        argc,
-        argv);
-
-
-    try
-    {
-        auto node =
-            std::make_shared<DockMotorController>();
-
-
-        rclcpp::spin(
-            node);
-    }
-    catch (const std::exception& e)
-    {
-        fprintf(
-            stderr,
-            "Fatal error: %s\n",
-            e.what());
-
+    rclcpp::init(argc, argv);
+    try {
+        auto node = std::make_shared<DockMotorController>();
+        rclcpp::spin(node);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Fatal: %s\n", e.what());
         rclcpp::shutdown();
-
         return 1;
     }
-
-
     rclcpp::shutdown();
-
     return 0;
 }

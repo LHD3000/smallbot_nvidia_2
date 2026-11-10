@@ -33,7 +33,7 @@ class RobotManager(Node):
         # 订阅遥控器
         self.subscription = self.create_subscription(
             Joy,
-            '/rc_input',
+            '/rc_input_b1',
             self.rc_callback,
             10
         )

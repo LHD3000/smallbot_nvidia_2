@@ -15,6 +15,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(trackmsg REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED) 
 
 add_subdirectory(asio-driver)
 add_subdirectory(control-algorithm)
@@ -41,7 +42,9 @@ ament_target_dependencies(balance_track_node
   trackmsg
   sensor_msgs
   tf2
+  tf2_geometry_msgs
 )
+
 add_executable(docking_control_node
     src/docking_control_node.cpp
 )
@@ -53,6 +56,8 @@ ament_target_dependencies(
     std_msgs
     sensor_msgs
     trackmsg
+    tf2
+    tf2_geometry_msgs
 )
 
 install(

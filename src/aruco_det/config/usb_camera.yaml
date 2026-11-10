@@ -1,0 +1,23 @@
+# Converted from original project intrinsics; NOT a new calibration of the connected camera.
+# The old launch used 640x480; verify this assumption by recalibrating this camera.
+calibration_verified: false
+image_width: 640
+image_height: 480
+camera_name: usb_camera
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [294.0025685593909, 0, 327.8364832091295, 0, 296.1201247428658, 237.8116466983579, 0, 0, 1]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.021385581716086424, -0.008718759329317297, 0.002012884309469192, 0.00041578810898600663, 0.0]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [294.0025685593909, 0, 327.8364832091295, 0, 0, 296.1201247428658, 237.8116466983579, 0, 0, 0, 1, 0]

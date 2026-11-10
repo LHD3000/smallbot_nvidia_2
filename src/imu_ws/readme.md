@@ -1,5 +1,4 @@
-cd /home/nvidia/jeston/smallbot_ws
-source install/setup.bash
+
 sudo ln -s /dev/ttyUSB1 /dev/imu_usb1
 ros2 launch wit_ros2_imu rviz_and_imu.launch.py 
 %新建终端
@@ -15,33 +14,28 @@ sh can_set.sh
 source install/setup.bash
 ros2 run balance_ros balance_track_node （主控）
 
+sudo date -s "2026-10-28 22:00:00"
+rm -rf build/balance_ros install/balance_ros
 colcon build（编译）
 sudo poweroff（关机）
 
-
+cd /home/nvidia/jeston/smallbot_ws/src/RTtrackros2_zed_ws/balance_ros/src
 python3 raw_plot.py (画图)
+
+视觉
+cd ~/jeston/smallbot_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch aruco_det usb_aruco.launch.py video_device:=/dev/video0 view:=false
 
 
 对接电机
-cd /sys/class/pwm/pwmchip3
-echo 0 | sudo tee export
-ls -l pwm0
-cd pwm0
-echo 50000 | sudo tee period
-echo 25000 | sudo tee duty_cycle
-echo 1 | sudo tee enable
-sudo cat /sys/kernel/debug/pwm
-启动
-echo 50000 | sudo tee /sys/class/pwm/pwmchip3/pwm0/period
-echo 40000 | sudo tee /sys/class/pwm/pwmchip3/pwm0/duty_cycle
-echo 1 | sudo tee /sys/class/pwm/pwmchip3/pwm0/enable
-停止
-echo 50000 | sudo tee /sys/class/pwm/pwmchip3/pwm0/duty_cycle
-echo 1 | sudo tee /sys/class/pwm/pwmchip3/pwm0/enable
-
+cd /home/nvidia/jeston/smallbot_ws
 source install/setup.bash
-sudo -v
 ros2 run dock_motor_controller dock_motor_controller
-ros2 topic pub --once /dock_motor/command std_msgs/msg/String "{data: run_cw}"
-ros2 topic pub --once /dock_motor/command std_msgs/msg/String "{data: run_ccw}"
-ros2 topic pub --once /dock_motor/command std_msgs/msg/String "{data: stop}"
+
+
+ros2 topic echo  /....  --once
+
+sudo systemctl restart imu.service
+sudo systemctl restart robot_manager.service
