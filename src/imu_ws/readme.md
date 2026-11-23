@@ -28,6 +28,12 @@ source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 launch aruco_det usb_aruco.launch.py video_device:=/dev/video0 view:=false
 
+标定
+cd ~/jeston
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch aruco_det calibrate_usb.launch.py video_device:=/dev/video0 \
+  board_size:=8x6 square_size:=0.020
 
 对接电机
 cd /home/nvidia/jeston/smallbot_ws
