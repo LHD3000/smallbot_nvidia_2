@@ -26,14 +26,19 @@ python3 raw_plot.py (画图)
 cd ~/jeston/smallbot_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ros2 launch aruco_det usb_aruco.launch.py video_device:=/dev/video0 view:=false
+接收相机话题：/image_raw/compressed
+输出二维码检测话题：/prometheus/camera/rgb/image_aruco_det
+检测结果话题（位姿）：/camera_link_state
+可视化：ros2 run rqt_image_view rqt_image_view，左上角选择对应图像话题即可。
+查看摄像头支持的分辨率和帧数v4l2-ctl -d /dev/video0 --list-formats-ext
+cd ~/jeston/smallbot_ws
+./start_vision.sh
+python3 ~/jeston/smallbot_ws/src/aruco/src/vision_plot.py
 
-标定
-cd ~/jeston
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 launch aruco_det calibrate_usb.launch.py video_device:=/dev/video0 \
-  board_size:=8x6 square_size:=0.020
+python3 ~/capture_chess.py /usb_cam/image_raws
+ros2 topic echo /aruco/camera_pose --field pose.pose.position
+ros2 topic echo /camera_link_state --field twist.twist.linear.x
+ros2 topic hz /camera_link_state
 
 对接电机
 cd /home/nvidia/jeston/smallbot_ws

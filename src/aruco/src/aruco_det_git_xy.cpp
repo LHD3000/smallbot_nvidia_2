@@ -4,10 +4,12 @@
 #include <iomanip>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <cstdlib>
 
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/image.hpp"
-#include "sensor_msgs/msg/compressed_image.hpp" // [修改处 1-a] 新增压缩图像消息头文件
+#include "sensor_msgs/msg/compressed_image.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "cv_bridge/cv_bridge.h"
@@ -15,7 +17,7 @@
 #include <Eigen/Dense>
 #include <opencv2/core.hpp>
 #include <opencv2/core/eigen.hpp>
-#include <opencv2/imgcodecs.hpp> // [修改处 1-b] 新增 imgcodecs 头文件以调用 cv::imdecode
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/aruco.hpp>
@@ -27,7 +29,6 @@ class ArucoDetectorNode : public rclcpp::Node
 public:
     ArucoDetectorNode() : Node("aruco_det_git")
     {
-        // [修改处 2] 默认话题改为 compressed 话题
         this->declare_parameter<std::string>("camera_topic", "/image_raw/compressed");
         this->declare_parameter<std::string>("output_topic", "/prometheus/camera/rgb/image_aruco_det");
         this->declare_parameter<std::string>("camera_parameters", "");
@@ -88,7 +89,6 @@ public:
         detector_params_ = cv::aruco::DetectorParameters::create();
 #endif
 
-        // [修改处 3] 订阅者消息类型改为 sensor_msgs::msg::CompressedImage
         image_sub_ = this->create_subscription<sensor_msgs::msg::CompressedImage>(
             camera_topic_, rclcpp::SensorDataQoS(),
             std::bind(&ArucoDetectorNode::cameraCallback, this, std::placeholders::_1));
@@ -96,6 +96,48 @@ public:
         pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/aruco/camera_pose", 10);
         cam_pose_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/camera_link_state", 10);
         aruco_img_pub_ = this->create_publisher<sensor_msgs::msg::Image>(output_topic_, 10);
+
+        // 打开数据记录文件（原始 / 滤波后 / 各自时间戳）
+        const char* home = std::getenv("HOME");
+        std::string data_dir = std::string(home ? home : "/home/nvidia") +
+                               "/jeston/smallbot_ws/src/aruco/src/";
+
+        raw_x_file_.open(data_dir + "vision_raw_x.txt");
+        filt_x_file_.open(data_dir + "vision_filtered_x.txt");
+        ts_raw_x_file_.open(data_dir + "vision_timestamp_raw_x.txt");
+        ts_filt_x_file_.open(data_dir + "vision_timestamp_filtered_x.txt");
+
+        raw_y_file_.open(data_dir + "vision_raw_y.txt");
+        filt_y_file_.open(data_dir + "vision_filtered_y.txt");
+        ts_raw_y_file_.open(data_dir + "vision_timestamp_raw_y.txt");
+        ts_filt_y_file_.open(data_dir + "vision_timestamp_filtered_y.txt");
+
+        raw_z_file_.open(data_dir + "vision_raw_z.txt");
+        filt_z_file_.open(data_dir + "vision_filtered_z.txt");
+        ts_raw_z_file_.open(data_dir + "vision_timestamp_raw_z.txt");
+        ts_filt_z_file_.open(data_dir + "vision_timestamp_filtered_z.txt");
+
+        raw_yaw_file_.open(data_dir + "vision_raw_yaw.txt");
+        filt_yaw_file_.open(data_dir + "vision_filtered_yaw.txt");
+        ts_raw_yaw_file_.open(data_dir + "vision_timestamp_raw_yaw.txt");
+        ts_filt_yaw_file_.open(data_dir + "vision_timestamp_filtered_yaw.txt");
+
+        if (!raw_x_file_)
+            RCLCPP_WARN(this->get_logger(), "Cannot open vision data files in %s", data_dir.c_str());
+        else
+            RCLCPP_INFO(this->get_logger(), "Vision data log dir: %s", data_dir.c_str());
+    }
+
+    ~ArucoDetectorNode()
+    {
+        raw_x_file_.close();  filt_x_file_.close();
+        ts_raw_x_file_.close();  ts_filt_x_file_.close();
+        raw_y_file_.close();  filt_y_file_.close();
+        ts_raw_y_file_.close();  ts_filt_y_file_.close();
+        raw_z_file_.close();  filt_z_file_.close();
+        ts_raw_z_file_.close();  ts_filt_z_file_.close();
+        raw_yaw_file_.close();  filt_yaw_file_.close();
+        ts_raw_yaw_file_.close();  ts_filt_yaw_file_.close();
     }
 
 private:
@@ -109,7 +151,6 @@ private:
         return !camMatrix.empty() && !distCoeffs.empty();
     }
 
-    // [修改处 4] 回调参数改为 CompressedImage::SharedPtr，并用 cv::imdecode 直接解码
     void cameraCallback(const sensor_msgs::msg::CompressedImage::SharedPtr msg)
     {
         cv::Mat frame = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
@@ -130,6 +171,7 @@ private:
 
         cv::Mat frameCopy = frame.clone();
         double disp_x = 0.0, disp_y = 0.0, disp_z = 0.0;
+        double disp_angle_y_deg = 0.0;
 
         if (!ids.empty())
         {
@@ -178,15 +220,61 @@ private:
                     disp_y = tvec[1];
                     disp_z = tvec[2];
 
-                    Eigen::Vector3d eulerAngles = rotation_matrix_eigen.eulerAngles(2, 1, 0);
-                    double sight_angle_y = eulerAngles[1] * 180.0 / PI;
+                    // 二维码法线（局部 z 轴）投影到相机 x-z 平面，绕相机 y 轴相对偏航角
+                    Eigen::Vector3d normal = rotation_matrix_eigen.col(2);
+                    double angle_y_rad = std::atan2(-normal.x(), -normal.z());
+                    disp_angle_y_deg = angle_y_rad * 180.0 / PI;
+
+                    // 一阶低通滤波（发布前）：f = α·raw + (1-α)·f_prev
+                    if (!filtered_init_)
+                    {
+                        filt_x_ = tvec[0];
+                        filt_y_ = tvec[1];
+                        filt_z_ = tvec[2];
+                        filt_angle_y_ = disp_angle_y_deg;
+                        filtered_init_ = true;
+                    }
+                    else
+                    {
+                        filt_x_   = lpf_alpha_ * tvec[0]               + (1 - lpf_alpha_) * filt_x_;
+                        filt_y_   = lpf_alpha_ * tvec[1]               + (1 - lpf_alpha_) * filt_y_;
+                        filt_z_   = lpf_alpha_ * tvec[2]               + (1 - lpf_alpha_) * filt_z_;
+                        filt_angle_y_ = lpf_alpha_ * disp_angle_y_deg  + (1 - lpf_alpha_) * filt_angle_y_;
+                    }
+
+                    // 记录原始 / 滤波后数据与时间戳
+                    if (raw_x_file_.is_open())
+                    {
+                        double now_ts = this->now().seconds();
+
+                        raw_x_file_  << tvec[0] << std::endl;
+                        filt_x_file_ << filt_x_ << std::endl;
+                        ts_raw_x_file_  << std::fixed << std::setprecision(9) << now_ts << std::endl;
+                        ts_filt_x_file_ << std::fixed << std::setprecision(9) << now_ts << std::endl;
+
+                        raw_y_file_  << tvec[1] << std::endl;
+                        filt_y_file_ << filt_y_ << std::endl;
+                        ts_raw_y_file_  << std::fixed << std::setprecision(9) << now_ts << std::endl;
+                        ts_filt_y_file_ << std::fixed << std::setprecision(9) << now_ts << std::endl;
+
+                        raw_z_file_  << tvec[2] << std::endl;
+                        filt_z_file_ << filt_z_ << std::endl;
+                        ts_raw_z_file_  << std::fixed << std::setprecision(9) << now_ts << std::endl;
+                        ts_filt_z_file_ << std::fixed << std::setprecision(9) << now_ts << std::endl;
+
+                        raw_yaw_file_  << disp_angle_y_deg << std::endl;
+                        filt_yaw_file_ << filt_angle_y_ << std::endl;
+                        ts_raw_yaw_file_  << std::fixed << std::setprecision(9) << now_ts << std::endl;
+                        ts_filt_yaw_file_ << std::fixed << std::setprecision(9) << now_ts << std::endl;
+                    }
 
                     nav_msgs::msg::Odometry cam_pose;
                     cam_pose.header.stamp = msg->header.stamp;
                     cam_pose.header.frame_id = camera_frame_;
-                    cam_pose.pose.pose.position.x = -tvec[0];
-                    cam_pose.pose.pose.position.y = -tvec[2];
-                    cam_pose.pose.pose.position.z =  tvec[1];
+                    // 位置发布滤波后的值
+                    cam_pose.pose.pose.position.x = filt_x_;
+                    cam_pose.pose.pose.position.y = filt_y_;
+                    cam_pose.pose.pose.position.z = filt_z_;
                     cam_pose.pose.pose.orientation = pose_msg.pose.orientation;
 
                     Eigen::Matrix3d inv_rot = rotation_matrix_eigen.inverse();
@@ -195,12 +283,8 @@ private:
                     cam_pose.twist.twist.angular.y = inv_euler[1] * 180.0 / PI;
                     cam_pose.twist.twist.angular.z = inv_euler[0] * 180.0 / PI;
 
-                    double yaw_ego = (sight_angle_y >= 0.0) ? (90.0 + sight_angle_y)
-                                                            : (90.0 - (180.0 + sight_angle_y));
-                    if (yaw_ego < 0.0)
-                        yaw_ego = -yaw_ego;
-
-                    cam_pose.twist.twist.linear.x = yaw_ego;
+                    // 航向角发布滤波后的 AngleY
+                    cam_pose.twist.twist.linear.x = filt_angle_y_;
                     cam_pose_pub_->publish(cam_pose);
                 }
             }
@@ -208,7 +292,9 @@ private:
 
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(3)
-            << "Cam X: " << disp_x << "  Y: " << disp_y << "  Z: " << disp_z;
+            << "Cam X: " << disp_x << "  Y: " << disp_y << "  Z: " << disp_z
+            << " | AngleY: " << disp_angle_y_deg << " deg";
+
         cv::putText(frameCopy, oss.str(), cv::Point(10, 30),
                     cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
 
@@ -224,6 +310,11 @@ private:
     cv::Mat cam_matrix_;
     cv::Mat dist_coeffs_;
 
+    // 一阶低通滤波状态（成员变量，跨帧保持）
+    bool filtered_init_ = false;
+    double lpf_alpha_ = 0.4;   // 0~1：越小越平滑、滞后越大
+    double filt_x_ = 0.0, filt_y_ = 0.0, filt_z_ = 0.0, filt_angle_y_ = 0.0;
+
 #if CV_VERSION_MAJOR > 4 || (CV_VERSION_MAJOR == 4 && CV_VERSION_MINOR >= 7)
     cv::aruco::Dictionary dictionary_;
     cv::aruco::DetectorParameters detector_params_;
@@ -233,7 +324,12 @@ private:
     cv::Ptr<cv::aruco::DetectorParameters> detector_params_;
 #endif
 
-    // [修改处 5] 订阅者成员变量类型同步更新为 CompressedImage
+    // 数据记录文件：位置 X/Y/Z、航向角 Yaw，原始 + 滤波后 + 各自时间戳
+    std::ofstream raw_x_file_, filt_x_file_, ts_raw_x_file_, ts_filt_x_file_;
+    std::ofstream raw_y_file_, filt_y_file_, ts_raw_y_file_, ts_filt_y_file_;
+    std::ofstream raw_z_file_, filt_z_file_, ts_raw_z_file_, ts_filt_z_file_;
+    std::ofstream raw_yaw_file_, filt_yaw_file_, ts_raw_yaw_file_, ts_filt_yaw_file_;
+
     rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr image_sub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr cam_pose_pub_;

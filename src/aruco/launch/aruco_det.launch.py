@@ -31,11 +31,11 @@ def generate_launch_description():
 
     # 直接在这里修改你的相机内参 [fx, 0, cx, 0, fy, cy, 0, 0, 1] 和畸变系数 [k1, k2, p1, p2, k3]
     camera_matrix = [
-        600.0,   0.0, 320.0,
-          0.0, 600.0, 240.0,
+        787.70,   0.0, 681.31,
+          0.0, 784.26, 355.39,
           0.0,   0.0,   1.0
     ]
-    distortion_coefficients = [0.0, 0.0, 0.0, 0.0, 0.0]
+    distortion_coefficients = [0.0424, -0.1282, 0.0, 0.0, 0.0]
 
     aruco_node = Node(
         package='aruco',
