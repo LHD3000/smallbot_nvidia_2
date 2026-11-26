@@ -50,3 +50,7 @@ ros2 topic echo  /....  --once
 
 sudo systemctl restart imu.service
 sudo systemctl restart robot_manager.service
+
+git add .
+git commit -m "init: 平衡小车代码"
+git push -u origin main --force
